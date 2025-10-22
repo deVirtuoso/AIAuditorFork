@@ -170,7 +170,8 @@ public class AIAuditor implements BurpExtension, ContextMenuItemsProvider, ScanC
 		AI_RESPONSE_FULL, // Full AI response JSON
 		RAW_CONTENT, // Raw content before JSON extraction
 		EXTRACTED_JSON,
-		TOKEN_INFO // Estimated tokens, number of requests
+		TOKEN_INFO, // Estimated tokens, number of requests
+		ERROR
 	}
 
 
@@ -1870,15 +1871,22 @@ private void processAIFindings(JSONObject aiResponse, HttpRequestResponse reques
         // Log raw content
         log("Raw content: " + content, LogCategory.RAW_CONTENT);
 
-        // Unwrap ```json ... ```
-        if (content.startsWith("```json")) {
-            content = content.substring(content.indexOf("{"), content.lastIndexOf("}") + 1);
-        }
+		// More robust JSON extraction to handle conversational prefixes/suffixes from the LLM
+		int jsonStart = content.indexOf('{');
+		int jsonEnd = content.lastIndexOf('}');
 
-        log("Extracted JSON: " + content, LogCategory.EXTRACTED_JSON);
+		if (jsonStart != -1 && jsonEnd != -1 && jsonEnd > jsonStart) {
+			content = content.substring(jsonStart, jsonEnd + 1);
+		} else {
+			// If we can't find a valid JSON object, log the issue and stop processing this response.
+			api.logging().logToError("AI response did not contain a valid JSON object. Raw content: " + content);
+			return;
+		}
 
-        // Parse findings JSON
-        JSONObject findingsJson = new JSONObject(content);
+		log("Extracted JSON: " + content, LogCategory.EXTRACTED_JSON);
+
+		// Parse findings JSON
+		JSONObject findingsJson = new JSONObject(content);
 
         // Ensure findings key exists
         if (!findingsJson.has("findings")) {
@@ -1961,87 +1969,145 @@ private void processAIFindings(JSONObject aiResponse, HttpRequestResponse reques
 
 private String extractContentFromResponse(JSONObject response, String model) {
     try {
-        String[] modelParts = model.split("/",2);
         String provider;
+        JSONArray candidates, choices;
 
+        // 🧩 Determine provider
+        String[] modelParts = model.split("/", 2);
         if (modelParts.length == 2) {
             provider = modelParts[0];
         } else {
-            // This block should ideally not be reached if all models are formatted as provider/model_name
-            log("Warning: extractContentFromResponse - Model \"" + model + "\" does not have a provider/model_name format. Attempting to infer.", LogCategory.GENERAL);
-            if (model.startsWith("gpt-")) {
-                provider = "openai";
-            } else if (model.startsWith("claude-")) {
-                provider = "claude";
-            } else if (model.startsWith("gemini-")) {
-                provider = "gemini";
-            } else if (model.startsWith("o1-")) {
-                provider = "openrouter";
-            } else if (model.equals("local-llm (LM Studio)")) {
-                provider = "local";
-            } else {
-                throw new IllegalArgumentException("Unknown model: " + model);
-            }
+            log("Warning: extractContentFromResponse - Model \"" + model +
+                "\" does not have a provider/model_name format. Attempting to infer.", LogCategory.GENERAL);
+
+            if (model.startsWith("gpt-")) provider = "openai";
+            else if (model.startsWith("claude-")) provider = "claude";
+            else if (model.startsWith("gemini-")) provider = "gemini";
+            else if (model.startsWith("o1-")) provider = "openrouter";
+            else if (model.equalsIgnoreCase("local-llm (LM Studio)")) provider = "local";
+            else throw new IllegalArgumentException("Unknown model: " + model);
         }
-        log("extractContentFromResponse: Selected Model: " + model + ", Determined Provider: " + provider, LogCategory.GENERAL);
 
+        log("extractContentFromResponse: Selected Model: " + model +
+            ", Determined Provider: " + provider, LogCategory.GENERAL);
+        log("Raw response: " + response.toString(2), LogCategory.API_RESPONSE);
 
-        // Log raw response for debugging
-        log("Raw response: " + response.toString(), LogCategory.API_RESPONSE);
+        // 🧠 Provider-specific extraction logic
+        switch (provider.toLowerCase()) {
 
-        switch (provider) {
-            case "claude":
-                // Extract "text" for Claude
+            // ========================
+            // CLAUDE
+            // ========================
+            case "claude": {
+                // Claude 2.x / 3.x often returns "content" as array of { type: "text", text: "..." }
                 if (response.has("content")) {
-                    JSONArray contentArray = response.getJSONArray("content");
-                    if (contentArray.length() > 0) {
-                        return contentArray.getJSONObject(0).getString("text");
-                    }
-                }
-                break;
+                    Object contentObj = response.get("content");
 
-            case "gemini":
-                // Extract "text" under "candidates" > "content" > "parts" for Gemini
-                JSONArray candidates = response.optJSONArray("candidates");
-                if (candidates != null && candidates.length() > 0) {
-                    JSONObject candidate = candidates.getJSONObject(0);
-                    JSONObject content = candidate.optJSONObject("content");
-                    if (content != null) {
-                        JSONArray parts = content.optJSONArray("parts");
-                        if (parts != null && parts.length() > 0) {
-                            return parts.getJSONObject(0).getString("text");
+                    if (contentObj instanceof JSONArray) {
+                        JSONArray contentArray = (JSONArray) contentObj;
+                        if (contentArray.length() > 0) {
+                            JSONObject first = contentArray.optJSONObject(0);
+                            if (first != null && first.has("text"))
+                                return first.getString("text");
+                            else
+                                return contentArray.optString(0, "");
                         }
+                    } else if (contentObj instanceof JSONObject) {
+                        JSONObject contentJSON = (JSONObject) contentObj;
+                        if (contentJSON.has("text")) return contentJSON.getString("text");
+                    } else if (contentObj instanceof String) {
+                        return (String) contentObj;
                     }
                 }
-                break;
 
+                // Claude sometimes nests data inside "completion" key
+                if (response.has("completion"))
+                    return response.optString("completion", "");
+
+                return "";
+            }
+
+            // ========================
+            // GEMINI
+            // ========================
+            case "gemini": {
+                candidates = response.optJSONArray("candidates");
+                if (candidates != null && candidates.length() > 0) {
+                    JSONObject candidate = candidates.optJSONObject(0);
+                    if (candidate != null) {
+                        // Modern Gemini (1.5+) response structure
+                        JSONObject contentObj = candidate.optJSONObject("content");
+                        if (contentObj != null) {
+                            JSONArray parts = contentObj.optJSONArray("parts");
+                            if (parts != null && parts.length() > 0) {
+                                JSONObject firstPart = parts.optJSONObject(0);
+                                if (firstPart != null && firstPart.has("text"))
+                                    return firstPart.getString("text");
+                            }
+                        }
+
+                        // Gemini fallback: sometimes text is directly inside candidate
+                        if (candidate.has("text"))
+                            return candidate.getString("text");
+                    }
+                }
+                return "";
+            }
+
+            // ========================
+            // OPENAI & OPENROUTER
+            // ========================
             case "openai":
-            case "openrouter":
-                return response
-                        .getJSONArray("choices")
-                        .getJSONObject(0)
-                        .getJSONObject("message")
-                        .getString("content");
+            case "openrouter": {
+                choices = response.optJSONArray("choices");
+                if (choices != null && choices.length() > 0) {
+                    JSONObject choice = choices.optJSONObject(0);
+                    if (choice != null) {
+                        // Modern format: choices[].message.content
+                        JSONObject message = choice.optJSONObject("message");
+                        if (message != null && message.has("content"))
+                            return message.optString("content");
 
-            case "local":
-                // return response.optString("content");
-				// Extract "content" under "choices" > "message" for LM Studio (OpenAI format)
-				JSONArray choices = response.optJSONArray("choices");
-				if (choices != null && choices.length() > 0) {
-					JSONObject choice = choices.getJSONObject(0);
-					JSONObject message = choice.optJSONObject("message");
-					if (message != null) {
-						// return message.optString("content");
-						return cleanLLMResponse(message.optString("content"), true);
-					}
-				}
-				break;
+                        // Older API variants: choices[].text
+                        if (choice.has("text"))
+                            return choice.optString("text");
+                    }
+                }
+                return "";
+            }
+
+            // ========================
+            // LOCAL (LM Studio, Ollama, etc.)
+            // ========================
+            case "local": {
+                choices = response.optJSONArray("choices");
+                if (choices != null && choices.length() > 0) {
+                    JSONObject choice = choices.optJSONObject(0);
+                    if (choice != null) {
+                        JSONObject message = choice.optJSONObject("message");
+                        if (message != null)
+                            return cleanLLMResponse(message.optString("content"), true);
+
+                        // Fallback: sometimes text appears directly
+                        if (choice.has("text"))
+                            return cleanLLMResponse(choice.optString("text"), true);
+                    }
+                }
+                return "";
+            }
+
+            // ========================
+            // UNKNOWN
+            // ========================
             default:
                 throw new IllegalArgumentException("Unsupported provider: " + provider);
         }
+
     } catch (Exception e) {
-        api.logging().logToError("Error extracting content from response: " + e.getMessage());
+        this.api.logging().logToError("Error extracting content from response: " + e.getMessage());
+        log("Error extracting content: " + e.getMessage(), LogCategory.ERROR);
     }
+
     return "";
 }
 
